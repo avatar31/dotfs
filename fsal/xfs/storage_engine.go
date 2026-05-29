@@ -4,17 +4,23 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sync"
 
 	"github.com/klauspost/reedsolomon"
+
+	"github.com/avatar31/dotfs/models"
 )
 
 const (
-	MaxChunkSize = 4 * 1024 * 1024 // 4 MB fixed chunk size
+	MegaByte     = 1024 * 1024
+	MaxChunkSize = 4 * MegaByte // 4 MB fixed chunk size
+	CPUCacheLine = 64           // 64 bytes for optimal alignment
 )
 
 type StorageEngine struct {
-	drives []Drive
+	drives   []Drive
+	driveMap map[int64]Drive // Lookup map
 
 	// Erasure Coding Parameters
 	rsEncoder    reedsolomon.Encoder
@@ -37,10 +43,17 @@ func NewStorageEngine(dataShards, parityShards int, drives []Drive) (*StorageEng
 		return nil, err
 	}
 
-	maxShardSize := (MaxChunkSize + dataShards - 1) / dataShards
+	maxShardSize := ComputeShardSize(MaxChunkSize, dataShards)
+	alignedMaxShardSize := ComputeAlignedShardSize(maxShardSize)
+
+	dMap := make(map[int64]Drive)
+	for _, d := range drives {
+		dMap[d.GetID()] = d
+	}
 
 	return &StorageEngine{
 		drives:       drives,
+		driveMap:     dMap,
 		rsEncoder:    enc,
 		DataShards:   dataShards,
 		ParityShards: parityShards,
@@ -49,7 +62,7 @@ func NewStorageEngine(dataShards, parityShards int, drives []Drive) (*StorageEng
 			New: func() any {
 				matrix := make([][]byte, totalShards)
 				for i := range matrix {
-					matrix[i] = make([]byte, maxShardSize)
+					matrix[i] = make([]byte, alignedMaxShardSize)
 				}
 				return matrix
 			},
@@ -63,16 +76,19 @@ func NewStorageEngine(dataShards, parityShards int, drives []Drive) (*StorageEng
 }
 
 // EncodeObjectByChunks processes an incoming stream of any size in ChunkSize(4MB) segments.
-func (se *StorageEngine) EncodeObjectByChunks(ctx context.Context, objectId string, size int64, data io.Reader) error {
+func (se *StorageEngine) EncodeObjectByChunks(ctx context.Context, meta *models.ObjectStorageMeta,
+	data io.Reader) ([]*models.ObjectChunk, error) {
 	// A reusable buffer to swallow up to 4MB from the reader at a time
 	dataBuffer := se.chunkPool.Get().([]byte)
 	defer se.chunkPool.Put(dataBuffer)
 
-	var chunkIdx int64 = 0
+	capEstimate := int(meta.Size/MaxChunkSize) + 1
+	chunks := make([]*models.ObjectChunk, 0, capEstimate)
+	var chunkIdx int64 = 1
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 
 		bytesRead, err := io.ReadFull(data, dataBuffer)
@@ -81,48 +97,93 @@ func (se *StorageEngine) EncodeObjectByChunks(ctx context.Context, objectId stri
 		}
 
 		if err != nil && err != io.ErrUnexpectedEOF {
-			return fmt.Errorf("failed to read chunk %d from stream: %w", chunkIdx, err)
+			return nil, fmt.Errorf("failed to read chunk %d from stream: %w", chunkIdx, err)
 		}
 
-		err = se.EncodeSingleChunk(ctx, objectId, chunkIdx, dataBuffer[:bytesRead])
+		chunk, err := se.EncodeSingleChunk(ctx, meta.Path, meta.Filename, chunkIdx, dataBuffer[:bytesRead])
 		if err != nil {
-			return err
+			return nil, err
 		}
 
+		chunk.Start = (chunkIdx - 1) * MaxChunkSize
+		chunk.End = chunk.Start + int64(bytesRead) - 1
+		chunks = append(chunks, chunk)
 		chunkIdx++
 	}
 
-	return nil
+	return chunks, nil
 }
 
-func (se *StorageEngine) EncodeSingleChunk(ctx context.Context, objectId string, chunkId int64, chunkData []byte) error {
+func (se *StorageEngine) EncodeSingleChunk(ctx context.Context, path, filename string, chunkId int64,
+	chunkData []byte) (*models.ObjectChunk, error) {
+	dataSize := len(chunkData)
 	shards := se.matrixPool.Get().([][]byte)
-	defer se.matrixPool.Put(shards)
-
-	// Dynamic calculation of shard sizes (e.g., 2560 bytes for a 10KB file)
-	currentShardSize := (len(chunkData) + se.DataShards - 1) / se.DataShards
-	for i := range shards {
-		clear(shards[i][:currentShardSize])
-	}
-
-	// Pivot sequential data into parallel shard structures
-	for i := 0; i < se.DataShards; i++ {
-		start := i * currentShardSize
-		if start >= len(chunkData) {
-			break
+	defer func() {
+		for i := range shards {
+			shards[i] = shards[i][:cap(shards[i])] // Reset slice length for reuse
 		}
-		end := min(start+currentShardSize, len(chunkData))
-		copy(shards[i][:end-start], chunkData[start:end])
+		se.matrixPool.Put(shards)
+	}()
+
+	minShardSize := ComputeShardSize(dataSize, se.DataShards)
+	alignedShardSize := ComputeAlignedShardSize(minShardSize)
+
+	// Safely clear and size ALL shards (Data + Parity) up to aligned size
+	for i := range shards {
+		if cap(shards[i]) < alignedShardSize {
+			shards[i] = make([]byte, alignedShardSize)
+		} else {
+			shards[i] = shards[i][:alignedShardSize]
+		}
+		clear(shards[i])
 	}
 
-	err := se.rsEncoder.Encode(shards[:se.TotalShards])
-	if err != nil {
-		return fmt.Errorf("erasure coding computation failed: %w", err)
+	shardsMeta := make([]*models.ObjectChunkShard, 0, se.TotalShards)
+
+	// Manually split and copy data into shards
+	for i := 0; i < se.DataShards; i++ {
+		start := i * minShardSize
+		if start >= dataSize {
+			shardsMeta = append(shardsMeta, &models.ObjectChunkShard{
+				Index:        i,
+				LogicalSize:  0,
+				PhysicalSize: int64(alignedShardSize),
+				Type:         models.ShardTypeData,
+				Path:         filepath.Join(path, fmt.Sprintf("%s.chunk_%d.shard_%d", filename, chunkId, i)),
+			})
+			continue
+		}
+		end := min(start+minShardSize, dataSize)
+
+		copy(shards[i], chunkData[start:end])
+
+		shardsMeta = append(shardsMeta, &models.ObjectChunkShard{
+			Index:        i,
+			LogicalSize:  int64(end - start),
+			PhysicalSize: int64(alignedShardSize),
+			Type:         models.ShardTypeData,
+			Path:         filepath.Join(path, fmt.Sprintf("%s.chunk_%d.shard_%d", filename, chunkId, i)),
+		})
 	}
 
-	err = se.dispatchChunkToPhysicalStorage(ctx, objectId, chunkId, shards, currentShardSize)
+	err := se.rsEncoder.Encode(shards)
 	if err != nil {
-		return fmt.Errorf("chunk dispatch failed: %w", err)
+		return nil, fmt.Errorf("erasure coding computation failed: %w", err)
+	}
+
+	for i := se.DataShards; i < se.TotalShards; i++ {
+		shardsMeta = append(shardsMeta, &models.ObjectChunkShard{
+			Index:        i,
+			LogicalSize:  int64(alignedShardSize),
+			PhysicalSize: int64(alignedShardSize),
+			Type:         models.ShardTypeParity,
+			Path:         filepath.Join(path, formattedFileName(filename, chunkId, i)),
+		})
+	}
+
+	err = se.dispatchChunkToPhysicalStorage(ctx, alignedShardSize, shards, shardsMeta)
+	if err != nil {
+		return nil, fmt.Errorf("chunk dispatch failed: %w", err)
 	}
 
 	// TODO: Atomic Commits: Store the chunk shards inside a temporary path (e.g., .tmp/) first.
@@ -130,10 +191,21 @@ func (se *StorageEngine) EncodeSingleChunk(ctx context.Context, objectId string,
 	// record changing its status to COMMITTED. If an operation fails, the index layer simply
 	// ignores uncommitted blocks, and a scavenger sweeps .tmp/ periodically.
 
-	return nil
+	physicalSize := int64(0)
+	for i := range shardsMeta {
+		physicalSize += shardsMeta[i].PhysicalSize
+	}
+
+	return &models.ObjectChunk{
+		ID:           chunkId,
+		LogicalSize:  int64(len(chunkData)),
+		PhysicalSize: physicalSize,
+		Shards:       shardsMeta,
+	}, nil
 }
 
-func (se *StorageEngine) dispatchChunkToPhysicalStorage(ctx context.Context, objectId string, chunkId int64, shards [][]byte, currentShardSize int) error {
+func (se *StorageEngine) dispatchChunkToPhysicalStorage(ctx context.Context, writeSize int,
+	shards [][]byte, shardsMeta []*models.ObjectChunkShard) error {
 	gCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -146,36 +218,180 @@ func (se *StorageEngine) dispatchChunkToPhysicalStorage(ctx context.Context, obj
 		}
 
 		wg.Add(1)
-		go func(shardIdx int, drive Drive) {
+		targetData := shards[i][:writeSize]
+
+		go func(shardIdx int, drive Drive, shardMeta *models.ObjectChunkShard, dataToWrite []byte) {
 			defer wg.Done()
 
 			if gCtx.Err() != nil {
 				return
 			}
 
-			fullpath := fmt.Sprintf("%s/%s.chunk_%d.shard_%d", drive.GetPath(), objectId, chunkId, shardIdx)
-			err := drive.Write(gCtx, fullpath, shards[shardIdx][:currentShardSize])
+			err := drive.Write(gCtx, filepath.Join(drive.GetPath(), shardMeta.Path), dataToWrite)
 			if err != nil {
-				fmt.Printf("Error writing shard %d to drive %s: %v\n", shardIdx, drive.GetPath(), err)
-				errChan <- fmt.Errorf("failed to write shard %d: %w", shardIdx, err)
-				cancel()
+				select {
+				case errChan <- fmt.Errorf("drive %d write failed: %w", drive.GetID(), err):
+					cancel()
+				default:
+				}
 				return
 			}
-		}(i, se.drives[i])
+
+			shardMeta.DriveId = drive.GetID()
+		}(i, se.drives[i], shardsMeta[i], targetData)
 	}
 
 	wg.Wait()
 	close(errChan)
 
 	if len(errChan) > 0 {
-		se.triggerRollbackCleanup(objectId, chunkId)
 		return <-errChan
 	}
 
 	return nil
 }
 
-func (se *StorageEngine) triggerRollbackCleanup(objectId string, chunkId int64) {
-	// Placeholder for rollback logic to delete any partially written shards in case of failure.
-	// This would involve iterating over the drives and removing any shards associated with the failed chunk.
+func (se *StorageEngine) ReadObjectByRange(ctx context.Context, meta *models.ObjectStorageMeta, offset, size int64, out io.Writer) error {
+	endOffset := offset + size
+
+	for _, chunk := range meta.Chunks {
+		// Skip chunks outside the requested byte range
+		if chunk.End < offset || chunk.Start >= endOffset {
+			continue
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		var shardSize int64
+		for _, s := range chunk.Shards {
+			if s != nil {
+				shardSize = s.PhysicalSize
+				break
+			}
+		}
+		if shardSize == 0 {
+			return fmt.Errorf("chunk %d has no valid shard metadata", chunk.ID)
+		}
+
+		chunkData, err := se.readAndProcessChunkWindow(ctx, chunk, shardSize)
+		if err != nil {
+			return fmt.Errorf("failed to read chunk %d: %w", chunk.ID, err)
+		}
+
+		// Trim to the portion of this chunk that falls within [offset, endOffset)
+		writeStart := max(offset-chunk.Start, 0)
+		writeEnd := min(endOffset-chunk.Start, chunk.LogicalSize)
+
+		if _, err := out.Write(chunkData[writeStart:writeEnd]); err != nil {
+			return fmt.Errorf("failed to write chunk %d data: %w", chunk.ID, err)
+		}
+	}
+
+	return nil
+}
+
+func (se *StorageEngine) readAndProcessChunkWindow(ctx context.Context, chunk *models.ObjectChunk, shardSize int64) ([]byte, error) {
+	shards := se.matrixPool.Get().([][]byte)
+	defer func() {
+		for i := range shards {
+			shards[i] = shards[i][:cap(shards[i])]
+		}
+		se.matrixPool.Put(shards)
+	}()
+
+	recovered := make([]bool, se.TotalShards)
+	var wg sync.WaitGroup
+
+	for _, shardMeta := range chunk.Shards {
+		idx := shardMeta.Index
+		if idx < 0 || idx >= se.TotalShards {
+			continue
+		}
+
+		drive, exists := se.driveMap[shardMeta.DriveId]
+		if !exists {
+			continue
+		}
+
+		wg.Add(1)
+		go func(targetIdx int, d Drive, sm *models.ObjectChunkShard) {
+			defer wg.Done()
+
+			shards[targetIdx] = shards[targetIdx][:shardSize]
+			path := filepath.Join(d.GetPath(), sm.Path)
+			_, err := d.Read(ctx, path, shards[targetIdx])
+			if err != nil {
+				return
+			}
+
+			recovered[targetIdx] = true
+		}(idx, drive, shardMeta)
+	}
+	wg.Wait()
+
+	needsReconstruct := false
+	for i := 0; i < se.DataShards; i++ {
+		if !recovered[i] {
+			needsReconstruct = true
+			break
+		}
+	}
+
+	if needsReconstruct {
+		for i := 0; i < se.TotalShards; i++ {
+			if !recovered[i] {
+				shards[i] = nil
+			} else {
+				shards[i] = shards[i][:shardSize]
+			}
+		}
+
+		if err := se.rsEncoder.ReconstructData(shards); err != nil {
+			return nil, fmt.Errorf("failed to reconstruct chunk %d: %w", chunk.ID, err)
+		}
+
+		// Re-verify all required shards are non-nil after recovery
+		for i := 0; i < se.DataShards; i++ {
+			if shards[i] == nil {
+				return nil, fmt.Errorf("failed to reconstruct chunk %d", chunk.ID)
+			}
+		}
+	}
+
+	chunkData := make([]byte, chunk.LogicalSize)
+	minShardSize := ComputeShardSize(int(chunk.LogicalSize), se.DataShards)
+
+	for i := 0; i < se.DataShards; i++ {
+		startOffset := int64(i * minShardSize)
+		if startOffset >= chunk.LogicalSize {
+			break
+		}
+		endOffset := min(startOffset+int64(minShardSize), chunk.LogicalSize)
+		bytesToCopy := endOffset - startOffset
+
+		copy(chunkData[startOffset:endOffset], shards[i][:bytesToCopy])
+	}
+
+	return chunkData, nil
+}
+
+// ComputeAlignedShardSize computes the optimal shard size for a given minimum data size,
+// ensuring 64-byte alignment for performance.
+// Formula:
+//
+//	((minShardSize + (CPUCacheLine - 1)) / CPUCacheLine) * CPUCacheLine
+func ComputeAlignedShardSize(shardSize int) int {
+	return (shardSize + (CPUCacheLine - 1)) &^ (CPUCacheLine - 1)
+}
+
+// ComputeShardSize calculates the minimum shard size using needed to store the given data size
+// across the specified number of data shards.
+func ComputeShardSize(dataSize, numberOfDataShards int) int {
+	return (dataSize + numberOfDataShards - 1) / numberOfDataShards
+}
+
+func formattedFileName(filename string, chunkId int64, i int) string {
+	return fmt.Sprintf("%s.chunk_%d.shard_%d", filename, chunkId, i)
 }

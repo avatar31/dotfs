@@ -10,8 +10,6 @@ import (
 
 type XFSStorage struct {
 	engine *StorageEngine
-	drives []Drive
-
 	MetaDB *omashu.Badger
 }
 
@@ -23,7 +21,11 @@ var (
 func NewXFSStorage(conf config.Config, metaDB *omashu.Badger) (*XFSStorage, error) {
 	var err error
 	once.Do(func() {
-		var drives []Drive
+		drives := make([]Drive, len(conf.Drives))
+		for i, path := range conf.Drives {
+			drives[i] = NewLocalDrive(int64(i+1), path)
+		}
+
 		var engine *StorageEngine
 		engine, err = NewStorageEngine(conf.DataShardCount, conf.ParityShardCount, drives)
 		if err != nil {
@@ -31,11 +33,7 @@ func NewXFSStorage(conf config.Config, metaDB *omashu.Badger) (*XFSStorage, erro
 			return
 		}
 
-		fs = &XFSStorage{
-			engine: engine,
-			drives: drives,
-			MetaDB: metaDB,
-		}
+		fs = &XFSStorage{engine: engine, MetaDB: metaDB}
 	})
 
 	return fs, err
