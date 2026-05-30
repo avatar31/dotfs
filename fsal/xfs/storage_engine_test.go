@@ -49,7 +49,7 @@ func getTestReader(data []byte) io.Reader {
 	return bytes.NewReader(data)
 }
 
-func getWorkingDrives() []Drive {
+func getWorkingMemDrives() []Drive {
 	drives := make([]Drive, testDataShards+testParShards)
 	for i := range drives {
 		drives[i] = newMemDrive(int64(i+1), fmt.Sprintf("/dev/memdrive%d", i))
@@ -64,7 +64,7 @@ func getTestShards(filename string, chunkId int64, drives []Drive, shardSize int
 		shards[i] = &models.ObjectChunkShard{
 			Index:        i,
 			PhysicalSize: shardSize,
-			Path:         filepath.Join("test", formattedFileName(filename, chunkId, i)),
+			Path:         filepath.Join("test", formatFileName(filename, chunkId, i)),
 			DriveId:      drives[i].GetID(),
 			Type:         models.ShardTypeData,
 		}
@@ -73,7 +73,7 @@ func getTestShards(filename string, chunkId int64, drives []Drive, shardSize int
 		shards[i] = &models.ObjectChunkShard{
 			Index:        i,
 			PhysicalSize: shardSize,
-			Path:         filepath.Join("test", formattedFileName(filename, chunkId, i)),
+			Path:         filepath.Join("test", formatFileName(filename, chunkId, i)),
 			DriveId:      drives[i].GetID(),
 			Type:         models.ShardTypeParity,
 		}
@@ -113,7 +113,7 @@ func getChunksFor10MBFile(filename string, drives []Drive) []*models.ObjectChunk
 }
 
 func TestReadWriteSuccess(t *testing.T) {
-	workingDrives := getWorkingDrives()
+	workingDrives := getWorkingMemDrives()
 	TenMBData := generateDeterministicTestData(10 * MegaByte)
 
 	test := []struct {
@@ -464,7 +464,7 @@ func TestErrorConditions(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		engine, err := NewStorageEngine(testDataShards, testParShards, getWorkingDrives())
+		engine, err := NewStorageEngine(testDataShards, testParShards, getWorkingMemDrives())
 		assert.NoError(t, err)
 
 		meta := &models.ObjectStorageMeta{
@@ -480,7 +480,7 @@ func TestErrorConditions(t *testing.T) {
 	})
 
 	t.Run("ReadObjectByRange respects context cancellation", func(t *testing.T) {
-		drives := getWorkingDrives()
+		drives := getWorkingMemDrives()
 		engine, err := NewStorageEngine(testDataShards, testParShards, drives)
 		assert.NoError(t, err)
 
@@ -503,4 +503,255 @@ func TestErrorConditions(t *testing.T) {
 		err = engine.ReadObjectByRange(ctx, meta, 0, MaxChunkSize, buf)
 		assert.ErrorIs(t, err, context.Canceled)
 	})
+}
+
+// ************* BENCHMARKS *************
+
+// Benchmark Test Run Date: 30/05/2026
+// StorageEngine.EncodeObjectByChunks with varying input sizes, both sequential and parallel execution
+//
+// goos: linux
+// goarch: amd64
+// pkg: github.com/avatar31/dotfs/fsal/xfs
+// cpu: Intel(R) Xeon(R) CPU E5-2698 v4 @ 2.20GHz
+// BenchmarkEncodeObjectByChunks/___1_Byte_Sequential-32            3964112               262.4 ns/op            35 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_10_Bytes_Sequential-32            5049697               277.5 ns/op            32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/100_Bytes_Sequential-32            3832717               302.3 ns/op            34 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_____1_KB_Sequential-32            3890738               283.2 ns/op            34 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/____10_KB_Sequential-32            4382577               282.6 ns/op            34 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/___100_KB_Sequential-32            3977504               281.5 ns/op            33 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_____1_MB_Sequential-32            4075522               256.0 ns/op            35 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_____4_MB_Sequential-32            3996378               256.9 ns/op            33 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/____10_MB_Sequential-32            5247495               239.5 ns/op            32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/___1_Byte___Parallel-32           95389552                12.05 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_10_Bytes___Parallel-32           87579350                13.40 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/100_Bytes___Parallel-32           104936760               12.27 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_____1_KB___Parallel-32           99328374                12.35 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/____10_KB___Parallel-32           85454770                12.71 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/___100_KB___Parallel-32           96725962                13.60 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_____1_MB___Parallel-32           97090353                12.98 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/_____4_MB___Parallel-32           99338318                13.79 ns/op           32 B/op          2 allocs/op
+// BenchmarkEncodeObjectByChunks/____10_MB___Parallel-32           85012278                12.96 ns/op           32 B/op          2 allocs/op
+// PASS
+// ok      github.com/avatar31/dotfs/fsal/xfs      34.744s
+func BenchmarkEncodeObjectByChunks(b *testing.B) {
+	engine, err := NewStorageEngine(testDataShards, testParShards, getWorkingMemDrives())
+	assert.NoError(b, err)
+
+	meta := &models.ObjectStorageMeta{
+		ObjectId: "benchmark",
+		Filename: "benchmark.txt",
+		Path:     "test",
+	}
+
+	benchmarks := []struct {
+		name string
+		data io.Reader
+	}{
+		{
+			name: "___1 Byte",
+			data: getTestReader(generateDeterministicTestData(1)),
+		},
+		{
+			name: "_10 Bytes",
+			data: getTestReader(generateDeterministicTestData(10)),
+		},
+		{
+			name: "100 Bytes",
+			data: getTestReader(generateDeterministicTestData(100)),
+		},
+		{
+			name: "_____1 KB",
+			data: getTestReader(generateDeterministicTestData(1 * KiloByte)),
+		},
+		{
+			name: "____10 KB",
+			data: getTestReader(generateDeterministicTestData(10 * KiloByte)),
+		},
+		{
+			name: "___100 KB",
+			data: getTestReader(generateDeterministicTestData(100 * KiloByte)),
+		},
+		{
+			name: "_____1 MB",
+			data: getTestReader(generateDeterministicTestData(1 * MegaByte)),
+		},
+		{
+			name: "_____4 MB",
+			data: getTestReader(generateDeterministicTestData(4 * MegaByte)),
+		},
+		{
+			name: "____10 MB",
+			data: getTestReader(generateDeterministicTestData(10 * MegaByte)),
+		},
+	}
+
+	b.ResetTimer()
+	for _, bm := range benchmarks {
+		b.Run(bm.name+"_Sequential", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				_, _ = engine.EncodeObjectByChunks(context.Background(), meta, bm.data)
+			}
+		})
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name+"___Parallel", func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					_, _ = engine.EncodeObjectByChunks(context.Background(), meta, bm.data)
+				}
+			})
+		})
+	}
+}
+
+// Benchmark Test Run Date: 30/05/2026
+// StorageEngine.ReadObjectByRange with varying input sizes without reconstructing, both sequential and parallel execution
+//
+// goos: linux
+// goarch: amd64
+// pkg: github.com/avatar31/dotfs/fsal/xfs
+// cpu: Intel(R) Xeon(R) CPU E5-2698 v4 @ 2.20GHz
+// BenchmarkReadObjectByRange/___1_Byte_Full_Read_Sequential-32               54993             19045 ns/op            1638 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/_10_Bytes_Full_Read_Sequential-32               54595             18652 ns/op            1531 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/100_Bytes_Full_Read_Sequential-32               50236             20470 ns/op            1693 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/_____1_KB_Full_Read_Sequential-32               36366             28983 ns/op            3565 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/____10_KB_Full_Read_Sequential-32               28629             38791 ns/op           22486 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/___100_KB_Full_Read_Sequential-32                4624            224119 ns/op          238863 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/_____1_MB_Full_Read_Sequential-32                 640           1717654 ns/op         2285617 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/_____4_MB_Full_Read_Sequential-32                 136           8282536 ns/op         8437375 B/op         24 allocs/op
+// BenchmarkReadObjectByRange/____10_MB_Full_Read_Sequential-32                  22          47968836 ns/op        42427708 B/op         75 allocs/op
+// BenchmarkReadObjectByRange/___1_Byte_Full_Read___Parallel-32            51010140                24.48 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/_10_Bytes_Full_Read___Parallel-32            56381806                24.52 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/100_Bytes_Full_Read___Parallel-32            64065188                23.35 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/_____1_KB_Full_Read___Parallel-32            59036188                24.50 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/____10_KB_Full_Read___Parallel-32            58875752                23.76 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/___100_KB_Full_Read___Parallel-32            85560050                23.43 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/_____1_MB_Full_Read___Parallel-32            57872354                25.11 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/_____4_MB_Full_Read___Parallel-32            73829329                23.80 ns/op           48 B/op          1 allocs/op
+// BenchmarkReadObjectByRange/____10_MB_Full_Read___Parallel-32            62655414                23.48 ns/op           48 B/op          1 allocs/op
+// PASS
+// ok      github.com/avatar31/dotfs/fsal/xfs      29.007s
+func BenchmarkReadObjectByRange(b *testing.B) {
+	engine, err := NewStorageEngine(testDataShards, testParShards, getWorkingMemDrives())
+	assert.NoError(b, err)
+
+	meta1BObj := &models.ObjectStorageMeta{ObjectId: "benchmark_1b", Filename: "benchmark_1b.txt", Path: "test"}
+	chunks1B, err := engine.EncodeObjectByChunks(context.Background(), meta1BObj, getTestReader(generateDeterministicTestData(1)))
+	assert.NoError(b, err)
+	meta1BObj.Chunks = chunks1B
+
+	meta10BObj := &models.ObjectStorageMeta{ObjectId: "benchmark_10b", Filename: "benchmark_10b.txt", Path: "test"}
+	chunks10B, err := engine.EncodeObjectByChunks(context.Background(), meta10BObj, getTestReader(generateDeterministicTestData(10)))
+	assert.NoError(b, err)
+	meta10BObj.Chunks = chunks10B
+
+	meta100BObj := &models.ObjectStorageMeta{ObjectId: "benchmark_100b", Filename: "benchmark_100b.txt", Path: "test"}
+	chunks100B, err := engine.EncodeObjectByChunks(context.Background(), meta100BObj, getTestReader(generateDeterministicTestData(100)))
+	assert.NoError(b, err)
+	meta100BObj.Chunks = chunks100B
+
+	meta1KBObj := &models.ObjectStorageMeta{ObjectId: "benchmark_1kb", Filename: "benchmark_1kb.txt", Path: "test"}
+	chunks1KB, err := engine.EncodeObjectByChunks(context.Background(), meta1KBObj, getTestReader(generateDeterministicTestData(1*KiloByte)))
+	assert.NoError(b, err)
+	meta1KBObj.Chunks = chunks1KB
+
+	meta10KBObj := &models.ObjectStorageMeta{ObjectId: "benchmark_10kb", Filename: "benchmark_10kb.txt", Path: "test"}
+	chunks10KB, err := engine.EncodeObjectByChunks(context.Background(), meta10KBObj, getTestReader(generateDeterministicTestData(10*KiloByte)))
+	assert.NoError(b, err)
+	meta10KBObj.Chunks = chunks10KB
+
+	meta100KBObj := &models.ObjectStorageMeta{ObjectId: "benchmark_100kb", Filename: "benchmark_100kb.txt", Path: "test"}
+	chunks100KB, err := engine.EncodeObjectByChunks(context.Background(), meta100KBObj, getTestReader(generateDeterministicTestData(100*KiloByte)))
+	assert.NoError(b, err)
+	meta100KBObj.Chunks = chunks100KB
+
+	meta1MBObj := &models.ObjectStorageMeta{ObjectId: "benchmark_1mb", Filename: "benchmark_1mb.txt", Path: "test"}
+	chunks1MB, err := engine.EncodeObjectByChunks(context.Background(), meta1MBObj, getTestReader(generateDeterministicTestData(1*MegaByte)))
+	assert.NoError(b, err)
+	meta1MBObj.Chunks = chunks1MB
+
+	meta4MBObj := &models.ObjectStorageMeta{ObjectId: "benchmark_4mb", Filename: "benchmark_4mb.txt", Path: "test"}
+	chunks4MB, err := engine.EncodeObjectByChunks(context.Background(), meta4MBObj, getTestReader(generateDeterministicTestData(4*MegaByte)))
+	assert.NoError(b, err)
+	meta4MBObj.Chunks = chunks4MB
+
+	meta10MBObj := &models.ObjectStorageMeta{ObjectId: "benchmark_10mb", Filename: "benchmark_10mb.txt", Path: "test"}
+	chunks10MB, err := engine.EncodeObjectByChunks(context.Background(), meta10MBObj, getTestReader(generateDeterministicTestData(10*MegaByte)))
+	assert.NoError(b, err)
+	meta10MBObj.Chunks = chunks10MB
+
+	benchmarks := []struct {
+		name       string
+		objectMeta *models.ObjectStorageMeta
+		readSize   int64
+	}{
+		{
+			name:       "___1 Byte Full Read",
+			objectMeta: meta1BObj,
+			readSize:   1,
+		},
+		{
+			name:       "_10 Bytes Full Read",
+			objectMeta: meta10BObj,
+			readSize:   10,
+		},
+		{
+			name:       "100 Bytes Full Read",
+			objectMeta: meta100BObj,
+			readSize:   100,
+		},
+		{
+			name:       "_____1 KB Full Read",
+			objectMeta: meta1KBObj,
+			readSize:   1 * KiloByte,
+		},
+		{
+			name:       "____10 KB Full Read",
+			objectMeta: meta10KBObj,
+			readSize:   10 * KiloByte,
+		},
+		{
+			name:       "___100 KB Full Read",
+			objectMeta: meta100KBObj,
+			readSize:   100 * KiloByte,
+		},
+		{
+			name:       "_____1 MB Full Read",
+			objectMeta: meta1MBObj,
+			readSize:   1 * MegaByte,
+		},
+		{
+			name:       "_____4 MB Full Read",
+			objectMeta: meta4MBObj,
+			readSize:   4 * MegaByte,
+		},
+		{
+			name:       "____10 MB Full Read",
+			objectMeta: meta10MBObj,
+			readSize:   10 * MegaByte,
+		},
+	}
+
+	b.ResetTimer()
+	for _, bm := range benchmarks {
+		b.Run(bm.name+"_Sequential", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				buf := new(bytes.Buffer)
+				_ = engine.ReadObjectByRange(context.Background(), bm.objectMeta, 0, bm.readSize, buf)
+			}
+		})
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name+"___Parallel", func(b *testing.B) {
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					buf := new(bytes.Buffer)
+					_ = engine.ReadObjectByRange(context.Background(), bm.objectMeta, 0, bm.objectMeta.Size, buf)
+				}
+			})
+		})
+	}
 }

@@ -13,7 +13,9 @@ import (
 )
 
 const (
-	MegaByte     = 1024 * 1024
+	KiloByte = 1024
+	MegaByte = KiloByte * 1024
+
 	MaxChunkSize = 4 * MegaByte // 4 MB fixed chunk size
 	CPUCacheLine = 64           // 64 bytes for optimal alignment
 )
@@ -177,7 +179,7 @@ func (se *StorageEngine) EncodeSingleChunk(ctx context.Context, path, filename s
 			LogicalSize:  int64(alignedShardSize),
 			PhysicalSize: int64(alignedShardSize),
 			Type:         models.ShardTypeParity,
-			Path:         filepath.Join(path, formattedFileName(filename, chunkId, i)),
+			Path:         filepath.Join(path, formatFileName(filename, chunkId, i)),
 		})
 	}
 
@@ -348,13 +350,15 @@ func (se *StorageEngine) readAndProcessChunkWindow(ctx context.Context, chunk *m
 			}
 		}
 
-		if err := se.rsEncoder.ReconstructData(shards); err != nil {
+		if err := se.Reconstruct(ctx, shards); err != nil {
 			return nil, fmt.Errorf("failed to reconstruct chunk %d: %w", chunk.ID, err)
 		}
 
 		// Re-verify all required shards are non-nil after recovery
 		for i := 0; i < se.DataShards; i++ {
 			if shards[i] == nil {
+				// TODO: Do we need to send error? Or can we just return zeroes
+				// for missing data shards after reconstruction?
 				return nil, fmt.Errorf("failed to reconstruct chunk %d", chunk.ID)
 			}
 		}
@@ -377,6 +381,14 @@ func (se *StorageEngine) readAndProcessChunkWindow(ctx context.Context, chunk *m
 	return chunkData, nil
 }
 
+func (se *StorageEngine) Reconstruct(ctx context.Context, shards [][]byte) error {
+	if err := se.rsEncoder.ReconstructData(shards); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // ComputeAlignedShardSize computes the optimal shard size for a given minimum data size,
 // ensuring 64-byte alignment for performance.
 // Formula:
@@ -392,6 +404,6 @@ func ComputeShardSize(dataSize, numberOfDataShards int) int {
 	return (dataSize + numberOfDataShards - 1) / numberOfDataShards
 }
 
-func formattedFileName(filename string, chunkId int64, i int) string {
+func formatFileName(filename string, chunkId int64, i int) string {
 	return fmt.Sprintf("%s.chunk_%d.shard_%d", filename, chunkId, i)
 }
